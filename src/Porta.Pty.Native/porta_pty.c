@@ -16,6 +16,7 @@
     #include <sys/ioctl.h>
     #include <sys/event.h>
     #include <sys/time.h>
+    #include <libproc.h>
 #else
     #include <pty.h>
     #include <sys/epoll.h>
@@ -33,7 +34,11 @@
 #if !defined(SYS_pidfd_open) && (defined(__x86_64__) || defined(__aarch64__))
     #define SYS_pidfd_open 434
 #endif
+#if !defined(SYS_close_range) && (defined(__x86_64__) || defined(__aarch64__))
+    #define SYS_close_range 436
 #endif
+#endif
+#include <sys/resource.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +136,79 @@ typedef struct {
  */
 static pthread_mutex_t pty_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Closes every descriptor above stderr in the forked child, before exec.
+ *
+ * forkpty does not mark the controller close-on-exec, and descriptors the host made without
+ * O_CLOEXEC (the poller's wakeup pipe, other terminals' controllers) were inherited by every child:
+ * terminal B could write into terminal A's controller. Only async-signal-safe calls are used here,
+ * since this runs between fork and exec of a multithreaded host.
+ */
+static void pty_close_inherited_fds(void)
+{
+#if defined(__APPLE__)
+    struct proc_fdinfo fds[512];
+    for (int pass = 0; pass < 64; pass++) {
+        int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)sizeof(fds));
+        if (bytes <= 0) {
+            break;
+        }
+        int n = bytes / (int)sizeof(fds[0]), closed = 0;
+        for (int i = 0; i < n; i++) {
+            if (fds[i].proc_fd > 2) {
+                close(fds[i].proc_fd);
+                closed++;
+            }
+        }
+        if (closed == 0) {
+            return;
+        }
+    }
+#else
+#if defined(SYS_close_range)
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0) {
+        return;
+    }
+#endif
+    int dir = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir >= 0) {
+        char buf[4096];
+        long n;
+        int restart = 1;
+        while (restart) {
+            restart = 0;
+            lseek(dir, 0, SEEK_SET);
+            while ((n = syscall(SYS_getdents64, dir, buf, sizeof(buf))) > 0) {
+                for (long off = 0; off < n;) {
+                    unsigned short reclen = *(unsigned short*)(buf + off + 16);
+                    const char* name = buf + off + 19;
+                    off += reclen;
+                    if (name[0] < '0' || name[0] > '9') {
+                        continue;
+                    }
+                    int fd = 0;
+                    for (const char* c = name; *c >= '0' && *c <= '9'; c++) {
+                        fd = fd * 10 + (*c - '0');
+                    }
+                    if (fd > 2 && fd != dir) {
+                        close(fd);
+                        restart = 1;
+                    }
+                }
+            }
+        }
+        close(dir);
+        return;
+    }
+#endif
+    /* Last resort: walk the whole table. */
+    struct rlimit rl;
+    long max = (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) ? (long)rl.rlim_cur : 65536;
+    for (long fd = 3; fd < max; fd++) {
+        close((int)fd);
+    }
+}
+
 PTY_EXPORT pty_spawn_result_t pty_spawn(
     const char* file,
     char* const argv[],
@@ -204,6 +282,10 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
     pthread_mutex_lock(&pty_spawn_lock);
     pid_t pid = forkpty(&master_fd, NULL, term_ptr, ws_ptr);
     int spawn_errno = errno;
+    if (pid > 0) {
+        /* Still under the lock, so no other terminal's child can inherit it from here on. */
+        fcntl(master_fd, F_SETFD, FD_CLOEXEC);
+    }
     if (pid != 0) {
         /* Parent, or forkpty failed. The child must not unlock a mutex it only has a copy of. */
         pthread_mutex_unlock(&pty_spawn_lock);
@@ -232,6 +314,8 @@ PTY_EXPORT pty_spawn_result_t pty_spawn(
             sigaction(sig, &dfl, NULL);
         }
         pthread_sigmask(SIG_SETMASK, &saved_mask, NULL);
+
+        pty_close_inherited_fds();
 
         /* Change working directory if specified */
         if (working_dir != NULL && working_dir[0] != '\0') {
