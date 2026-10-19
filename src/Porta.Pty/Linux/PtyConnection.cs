@@ -34,8 +34,11 @@ namespace Porta.Pty.Linux
         /// <inheritdoc/>
         protected override bool Kill(int controller)
         {
-            return pty_kill(this.Pid, SIGHUP) != -1;
+            return this.SignalChild(SIGHUP);
         }
+
+        /// <inheritdoc/>
+        protected override int SendSignal(int pid, int signal) => pty_kill(pid, signal);
 
         /// <inheritdoc/>
         protected override bool Resize(int controller, int cols, int rows)

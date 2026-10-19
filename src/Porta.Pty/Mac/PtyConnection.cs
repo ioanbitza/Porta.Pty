@@ -3,7 +3,6 @@
 
 namespace Porta.Pty.Mac
 {
-    using System.Threading;
     using static Porta.Pty.Mac.NativeMethods;
 
     /// <summary>
@@ -35,18 +34,19 @@ namespace Porta.Pty.Mac
         /// <inheritdoc/>
         protected override bool Kill(int controller)
         {
-            // First try SIGHUP (standard terminal hangup signal)
-            // This is the proper signal for terminal processes
-            bool result = pty_kill(this.Pid, SIGHUP) != -1;
-            
-            // Give a brief moment for graceful shutdown
-            Thread.Sleep(100);
-            
-            // Then send SIGKILL to ensure termination (cannot be caught or ignored)
-            pty_kill(this.Pid, SIGKILL);
-            
+            // SIGHUP first, then SIGKILL only if the child is still there after a brief grace period.
+            // Both go through SignalChild, so neither reaches a pid that has been collected meanwhile.
+            bool result = this.SignalChild(SIGHUP);
+            if (!this.WaitForExit(100))
+            {
+                this.SignalChild(SIGKILL);
+            }
+
             return result;
         }
+
+        /// <inheritdoc/>
+        protected override int SendSignal(int pid, int signal) => pty_kill(pid, signal);
 
         /// <inheritdoc/>
         protected override bool Resize(int controller, int cols, int rows)

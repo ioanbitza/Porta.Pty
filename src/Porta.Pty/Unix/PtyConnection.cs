@@ -23,6 +23,14 @@ namespace Porta.Pty.Unix
         private readonly PtyDescriptor descriptor;
         private readonly int pid;
         private readonly ManualResetEvent terminalProcessTerminatedEvent = new ManualResetEvent(false);
+
+        /// <summary>
+        /// Serialises collecting the child with signalling it. While the child is not collected its pid
+        /// cannot be reissued (at worst it is a zombie), so a signal sent under this lock with
+        /// <see cref="reaped"/> still false can only reach the child.
+        /// </summary>
+        private readonly object signalGate = new object();
+        private bool reaped;
         private int exitCode;
         private int exitSignal;
         private bool isDisposed;
@@ -95,7 +103,7 @@ namespace Porta.Pty.Unix
                 // One reaper for the whole process instead of a thread apiece. This is the half that
                 // actually moves the number: making reads threadless still left a watcher per
                 // connection blocked in waitpid.
-                PtyReaper.Instance.Register(pid, this.WaitPidNoHang, this.OnChildExited);
+                PtyReaper.Instance.Register(pid, this.ReapNoHang, this.OnChildExited);
             }
             else
             {
@@ -177,6 +185,11 @@ namespace Porta.Pty.Unix
         /// <inheritdoc/>
         public void Kill()
         {
+            if (Volatile.Read(ref this.reaped))
+            {
+                return;
+            }
+
             if (!this.Kill(this.controller))
             {
                 int errno = Marshal.GetLastWin32Error();
@@ -242,6 +255,50 @@ namespace Porta.Pty.Unix
         /// <returns>True if the function succeeded to get the status of the process, false otherwise.</returns>
         protected abstract bool WaitPid(int pid, ref int status);
 
+        /// <summary>OS-specific kill(2) by pid; only <see cref="SignalChild"/> calls it.</summary>
+        /// <param name="pid">The process id to signal.</param>
+        /// <param name="signal">The signal number.</param>
+        /// <returns>0 on success, -1 on failure with errno set.</returns>
+        protected abstract int SendSignal(int pid, int signal);
+
+        /// <summary>
+        /// Sends a signal to the child unless it has already been collected, under the same lock that
+        /// collecting it takes, so the pid cannot have been handed to another process meanwhile.
+        /// </summary>
+        /// <param name="signal">The signal number.</param>
+        /// <returns>True when the signal was sent or there was nothing left to signal.</returns>
+        protected bool SignalChild(int signal)
+        {
+            lock (this.signalGate)
+            {
+                if (this.reaped)
+                {
+                    return true;
+                }
+
+                return this.SendSignal(this.pid, signal) != -1;
+            }
+        }
+
+        /// <summary>Blocks until the pid has exited, leaving it uncollected (waitid with WNOWAIT).</summary>
+        [DllImport("libporta_pty", SetLastError = true)]
+        private static extern int pty_wait_exit_noreap(int pid);
+
+        /// <summary>Collects the child if it has exited, marking it reaped under the signal lock.</summary>
+        private int ReapNoHang(int pid, ref int status)
+        {
+            lock (this.signalGate)
+            {
+                int result = this.WaitPidNoHang(pid, ref status);
+                if (result == pid || (result == -1 && Marshal.GetLastPInvokeError() == ECHILD))
+                {
+                    this.reaped = true;
+                }
+
+                return result;
+            }
+        }
+
         /// <summary>
         /// Attempts to kill the process without throwing an exception.
         /// </summary>
@@ -278,6 +335,31 @@ namespace Porta.Pty.Unix
             Debug.WriteLine($"Waiting on {this.pid}");
 
             int status = 0;
+
+            // Wait without collecting, then collect under the signal lock, so no signal can be sent
+            // between waitpid releasing the pid and the connection learning that it did.
+            if (pty_wait_exit_noreap(this.pid) == 0)
+            {
+                int result;
+                do
+                {
+                    result = this.ReapNoHang(this.pid, ref status);
+                }
+                while (result == -1 && Marshal.GetLastPInvokeError() == EINTR);
+
+                if (result == this.pid)
+                {
+                    this.OnChildExited(status);
+                    return;
+                }
+
+                if (result == -1 && Marshal.GetLastPInvokeError() == ECHILD)
+                {
+                    this.MarkReaped();
+                    return;
+                }
+            }
+
             if (!this.WaitPid(this.pid, ref status))
             {
                 int errno = Marshal.GetLastWin32Error();
@@ -288,8 +370,8 @@ namespace Porta.Pty.Unix
                 }
                 else if (errno == ECHILD)
                 {
-                    // waitpid is already handled elsewhere.
-                    // Not an error.
+                    // Collected by someone else: the pid is free and may already be another process's.
+                    this.MarkReaped();
                 }
                 else
                 {
@@ -300,7 +382,20 @@ namespace Porta.Pty.Unix
             }
 
             Debug.WriteLine($"Wait succeeded");
+            this.MarkReaped();
             this.OnChildExited(status);
+        }
+
+        /// <summary>
+        /// Records that the child is collected, under the lock <see cref="SignalChild"/> takes, so no signal
+        /// leaves for its pid from here on.
+        /// </summary>
+        private void MarkReaped()
+        {
+            lock (this.signalGate)
+            {
+                this.reaped = true;
+            }
         }
 
         /// <summary>

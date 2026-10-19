@@ -600,6 +600,21 @@ PTY_EXPORT int pty_exit_drain(int queue, int *pids, int max)
 #endif
 }
 
+/*
+ * Waits until pid has exited WITHOUT collecting it (WNOWAIT), so the caller can collect it under its
+ * own lock. Until it is collected the pid stays a zombie and cannot be handed to another process.
+ */
+PTY_EXPORT int pty_wait_exit_noreap(int pid)
+{
+    siginfo_t info;
+    int r;
+    do {
+        memset(&info, 0, sizeof(info));
+        r = waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT);
+    } while (r == -1 && errno == EINTR);
+    return r;
+}
+
 PTY_EXPORT int pty_get_errno(void)
 {
     return errno;
