@@ -206,11 +206,31 @@ namespace Porta.Pty.Unix
         }
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// Goes through the counted path of the descriptor, like reads and writes: once the connection
+        /// is disposed, the number it kept may already belong to the next terminal, and an ioctl on it
+        /// would resize that one instead.
+        /// </remarks>
+        /// <exception cref="ObjectDisposedException">The pseudoterminal is already closed.</exception>
         public void Resize(int cols, int rows)
         {
-            if (!this.Resize(this.controller, cols, rows))
+            if (!this.descriptor.TryAcquire())
             {
-                throw new InvalidOperationException($"Resizing terminal failed with error {Marshal.GetLastWin32Error()}");
+                throw new ObjectDisposedException(
+                    nameof(PtyConnection),
+                    $"The pseudoterminal of process {this.pid} is closed, so it cannot be resized.");
+            }
+
+            try
+            {
+                if (!this.Resize(this.descriptor.Raw, cols, rows))
+                {
+                    throw new InvalidOperationException($"Resizing terminal failed with error {Marshal.GetLastWin32Error()}");
+                }
+            }
+            finally
+            {
+                this.descriptor.Release();
             }
         }
 
