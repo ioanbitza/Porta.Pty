@@ -106,6 +106,120 @@ namespace Porta.Pty.Tests
                 useAsyncIo);
         }
 
+        /// <summary>
+        /// Guards the macOS close loop against skipping fd 3 (<c>&gt; 3</c> for <c>&gt; 2</c>), with more
+        /// descriptors open than one listing pass returns. The host holds 600 descriptors made without
+        /// O_CLOEXEC, and fd 3 is made inheritable for the length of the test (opened on /dev/null when free,
+        /// its close-on-exec cleared and restored otherwise), so a child that inherited any of them lists it.
+        /// The listing runs to 4095, past the 600. A loop limited to a single pass of 512 still passes here,
+        /// because a loop that ends without a pass closing nothing falls through to the walk of the whole
+        /// table, which closes the rest (measured: one pass stopped at fd 516 and B listed none).
+        /// </summary>
+        [TestMethod]
+        [DataRow(false, DisplayName = "blocking")]
+        [DataRow(true, DisplayName = "non-blocking")]
+        public async Task Unix_ProgramSeesNoneOfSixHundredInheritableDescriptors_Fd3Included(bool useAsyncIo)
+        {
+            if (IsWindows)
+            {
+                Assert.Inconclusive("fork/exec descriptor inheritance is a Unix concern; ConPTY starts its own console host");
+            }
+
+            var opened = new List<int>();
+            var restoreFd3 = MakeFd3Inheritable();
+            try
+            {
+                for (var i = 0; i < 600; i++)
+                {
+                    var fd = open("/dev/null", O_RDONLY);
+                    if (fd < 0)
+                    {
+                        Assert.Inconclusive($"open(/dev/null) number {i} failed with errno {Marshal.GetLastPInvokeError()}: the host cannot hold 600 descriptors");
+                    }
+
+                    opened.Add(fd);
+                }
+
+                using var cts = new CancellationTokenSource(TestTimeoutMs);
+                const string script =
+                    "fds=''; n=3; "
+                    + "while [ $n -lt 4096 ]; do if [ -e /dev/fd/$n ]; then fds=\"$fds $n\"; fi; n=$((n+1)); done; "
+                    + "echo FDS-BEGIN $fds FDS-END; echo B-DONE";
+                using IPtyConnection terminalB = await PtyProvider.SpawnAsync(
+                    Shell("B", "/bin/sh", new[] { "-c", script }, useAsyncIo), cts.Token);
+                var outputB = new Pump(terminalB);
+                (await outputB.WaitForAsync("B-DONE", TestTimeoutMs)).Should().BeTrue(
+                    "terminal B's script should finish; its output was: {0}", outputB.Text);
+
+                var listed = InheritedDescriptors(outputB.Text);
+                listed.Should().BeEmpty(
+                    "the program should hold only stdin, stdout and stderr while the host holds {0} inheritable descriptors "
+                    + "(fd 3 and {1} to {2}), but it listed [{3}] (useAsyncIo={4})",
+                    opened.Count + 1,
+                    opened[0],
+                    opened[^1],
+                    string.Join(", ", listed),
+                    useAsyncIo);
+            }
+            finally
+            {
+                foreach (var fd in opened)
+                {
+                    close(fd);
+                }
+
+                restoreFd3();
+            }
+        }
+
+        /// <summary>Makes fd 3 inheritable and returns how to put it back as it was.</summary>
+        private static Action MakeFd3Inheritable()
+        {
+            const int Fd3 = 3;
+            var flags = fcntl(Fd3, F_GETFD);
+            if (flags == -1)
+            {
+                var devNull = open("/dev/null", O_RDONLY);
+                devNull.Should().BeGreaterThan(2, $"open(/dev/null) failed with errno {Marshal.GetLastPInvokeError()}");
+                dup2(devNull, Fd3).Should().Be(Fd3, $"dup2 onto fd 3 failed with errno {Marshal.GetLastPInvokeError()}");
+                close(devNull);
+                return () => close(Fd3);
+            }
+
+            if ((flags & FD_CLOEXEC) == 0)
+            {
+                return () => { };
+            }
+
+            ioctl(Fd3, FIONCLEX).Should().Be(0, $"clearing close-on-exec on fd 3 failed with errno {Marshal.GetLastPInvokeError()}");
+            return () => ioctl(Fd3, FIOCLEX);
+        }
+
+        private const int O_RDONLY = 0;
+        private const int F_GETFD = 1;
+        private const int FD_CLOEXEC = 1;
+
+        private static ulong FIOCLEX => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? 0x20006601UL : 0x5451UL;
+
+        private static ulong FIONCLEX => RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? 0x20006602UL : 0x5450UL;
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int open(string path, int flags);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int close(int fd);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int dup2(int fd, int target);
+
+        /// <summary>fcntl without its variadic third argument, which F_GETFD does not take.</summary>
+        [DllImport("libc", SetLastError = true)]
+        private static extern int fcntl(int fd, int command);
+
+        /// <summary>ioctl without its variadic third argument, which FIOCLEX and FIONCLEX do not take.</summary>
+        [DllImport("libc", SetLastError = true)]
+        private static extern int ioctl(int fd, ulong request);
+
         private static int[] InheritedDescriptors(string output)
         {
             var begin = output.IndexOf("FDS-BEGIN", StringComparison.Ordinal);

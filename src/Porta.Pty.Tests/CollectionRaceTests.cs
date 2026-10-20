@@ -281,6 +281,76 @@ namespace Porta.Pty.Tests
         }
 
         /// <summary>
+        /// Guards the macOS platform kill step against sending SIGHUP or SIGKILL straight to the pid instead
+        /// of through SignalChild; no other test fails when it does. The step is called directly,
+        /// past the public Kill's own check, so only SignalChild's check stands between it and a free pid.
+        /// Once before the step: the test ends the child and waits until the library has collected it; the
+        /// step must send nothing. Once during the grace period: the collected flag is set as SIGHUP leaves,
+        /// with the exit event still unset, so the step waits its 100 ms and reaches SIGKILL with the child
+        /// collected; only SIGHUP may have been sent. Nothing is sent for real (forward: false).
+        /// </summary>
+        [TestMethod]
+        [DataRow(true, false, DisplayName = "collected before the step, blocking")]
+        [DataRow(true, true, DisplayName = "collected before the step, non-blocking")]
+        [DataRow(false, false, DisplayName = "collected during the grace period, blocking")]
+        [DataRow(false, true, DisplayName = "collected during the grace period, non-blocking")]
+        public void Mac_ThePlatformKillStep_SignalsNoCollectedChild(bool collectedBefore, bool useAsyncIo)
+        {
+            if (!IsMac)
+            {
+                Assert.Inconclusive("the SIGHUP then SIGKILL kill step is the macOS one");
+            }
+
+            var pid = SpawnChild("exec /bin/sleep 600");
+            WaitUntilRunning(pid, "/bin/sleep");
+            var sent = new ConcurrentQueue<Sent>();
+            using var mac = new RecordingMacConnection(OpenDevNull(), pid, useAsyncIo, forward: false, sent);
+            var reaped = typeof(Unix.PtyConnection).GetField("reaped", BindingFlags.Instance | BindingFlags.NonPublic);
+            reaped.Should().NotBeNull("Unix.PtyConnection should keep its collected flag in a field named reaped");
+
+            try
+            {
+                if (collectedBefore)
+                {
+                    kill(pid, SIGTERM).Should().Be(0, $"kill(2) of the running child failed with errno {Marshal.GetLastPInvokeError()}");
+                    if (!mac.WaitForExit(TestTimeoutMs))
+                    {
+                        Assert.Inconclusive($"the library did not collect child {pid} within {TestTimeoutMs} ms (the lost exit of the non-blocking reaper)");
+                    }
+                }
+                else
+                {
+                    mac.AfterSignal = signal =>
+                    {
+                        if (signal == SIGHUP)
+                        {
+                            reaped!.SetValue(mac, true);
+                        }
+                    };
+                }
+
+                mac.PlatformKill();
+
+                var signals = sent.Select(s => s.Signal).ToArray();
+                signals.Should().Equal(
+                    collectedBefore ? Array.Empty<int>() : new[] { SIGHUP },
+                    "the platform kill step must not signal a child the library has collected ({0}, useAsyncIo={1}); it sent [{2}]",
+                    collectedBefore ? "collected before the step" : "collected during the grace period",
+                    useAsyncIo,
+                    string.Join(", ", signals));
+            }
+            finally
+            {
+                if (!collectedBefore)
+                {
+                    // Still running and not collected (the flag was set by the test), so the pid is still the child's.
+                    kill(pid, SIGKILL);
+                    mac.WaitForExit(TestTimeoutMs);
+                }
+            }
+        }
+
+        /// <summary>
         /// The controller is close-on-exec from the moment pty_spawn returns, so a process the host starts
         /// outside Porta (Process.Start) does not inherit terminal A's controller. Closing descriptors in
         /// Porta's own children cannot cover these. The terminals each child holds above stderr are listed
@@ -463,11 +533,18 @@ namespace Porta.Pty.Tests
 
             public bool Signal(int signal) => this.SignalChild(signal);
 
+            /// <summary>Called with each signal once it is recorded, on the thread that sent it.</summary>
+            public Action<int>? AfterSignal { get; set; }
+
+            /// <summary>The platform kill step itself, without the public Kill's check before it.</summary>
+            public bool PlatformKill() => this.Kill(0);
+
             protected override int SendSignal(int pid, int signal)
             {
                 var result = this.forward ? base.SendSignal(pid, signal) : 0;
                 var errno = result == -1 ? Marshal.GetLastPInvokeError() : 0;
                 this.sent.Enqueue(new Sent(signal, result, errno));
+                this.AfterSignal?.Invoke(signal);
                 if (result == -1)
                 {
                     Marshal.SetLastPInvokeError(errno);
