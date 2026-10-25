@@ -171,10 +171,11 @@ namespace Porta.Pty.Unix
             // back to back and the third started failing; each test alone had always been fine.
             this.TryClose();
 
-            // Deliberately NOT unregistering from the reaper. TryKill above sends SIGHUP and then
-            // SIGKILL, but a signalled child is not a collected one -- it stays a zombie until
-            // somebody waits on it. Dropping the registration here meant nothing ever did, so a
-            // disposed connection leaked a process table entry for the life of the host.
+            // Deliberately NOT unregistering from the reaper. TryKill above signals a child that is
+            // not collected yet (SIGHUP, and on macOS SIGKILL if it outlives the grace period), but a
+            // signalled child is not a collected one -- it stays a zombie until somebody waits on it.
+            // Dropping the registration here meant nothing ever did, so a disposed connection leaked
+            // a process table entry for the life of the host.
             //
             // The blocking path does not have that problem because its watcher thread stays in
             // waitpid until the child is collected, and keeps doing so after Dispose. Leaving the
