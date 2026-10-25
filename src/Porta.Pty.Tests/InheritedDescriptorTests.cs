@@ -107,18 +107,20 @@ namespace Porta.Pty.Tests
         }
 
         /// <summary>
-        /// Guards the macOS close loop against skipping fd 3 (<c>&gt; 3</c> for <c>&gt; 2</c>), with more
-        /// descriptors open than one listing pass returns. The host holds 600 descriptors made without
-        /// O_CLOEXEC, and fd 3 is made inheritable for the length of the test (opened on /dev/null when free,
-        /// its close-on-exec cleared and restored otherwise), so a child that inherited any of them lists it.
-        /// The listing runs to 4095, past the 600. A loop limited to a single pass of 512 still passes here,
-        /// because a loop that ends without a pass closing nothing falls through to the walk of the whole
-        /// table, which closes the rest (measured: one pass stopped at fd 516 and B listed none).
+        /// Guards the macOS cleanup in the child against skipping fd 3 (<c>&gt; 3</c> for <c>&gt; 2</c>), and
+        /// against stopping at what one listing returns. fd 3 is made inheritable for the length of the test
+        /// (opened on /dev/null when free, its close-on-exec cleared and restored otherwise), and the host
+        /// opens either no more descriptors or 600 more without O_CLOEXEC, so a child that inherited any of
+        /// them lists it. The listing runs to 4095, past the 600. With fd 3 alone the child's listing of 512
+        /// is not full and the cleanup ends there, so only that listing covers fd 3; with 600 more it is full,
+        /// and only the walk of the whole table that follows covers the descriptors past it.
         /// </summary>
         [TestMethod]
-        [DataRow(false, DisplayName = "blocking")]
-        [DataRow(true, DisplayName = "non-blocking")]
-        public async Task Unix_ProgramSeesNoneOfSixHundredInheritableDescriptors_Fd3Included(bool useAsyncIo)
+        [DataRow(false, 0, DisplayName = "fd 3 alone, blocking")]
+        [DataRow(true, 0, DisplayName = "fd 3 alone, non-blocking")]
+        [DataRow(false, 600, DisplayName = "fd 3 and 600 more, blocking")]
+        [DataRow(true, 600, DisplayName = "fd 3 and 600 more, non-blocking")]
+        public async Task Unix_ProgramSeesNoInheritableDescriptorOfTheHost_Fd3Included(bool useAsyncIo, int more)
         {
             if (IsWindows)
             {
@@ -129,12 +131,12 @@ namespace Porta.Pty.Tests
             var restoreFd3 = MakeFd3Inheritable();
             try
             {
-                for (var i = 0; i < 600; i++)
+                for (var i = 0; i < more; i++)
                 {
                     var fd = open("/dev/null", O_RDONLY);
                     if (fd < 0)
                     {
-                        Assert.Inconclusive($"open(/dev/null) number {i} failed with errno {Marshal.GetLastPInvokeError()}: the host cannot hold 600 descriptors");
+                        Assert.Inconclusive($"open(/dev/null) number {i} failed with errno {Marshal.GetLastPInvokeError()}: the host cannot hold {more} more descriptors");
                     }
 
                     opened.Add(fd);
@@ -153,11 +155,10 @@ namespace Porta.Pty.Tests
 
                 var listed = InheritedDescriptors(outputB.Text);
                 listed.Should().BeEmpty(
-                    "the program should hold only stdin, stdout and stderr while the host holds {0} inheritable descriptors "
-                    + "(fd 3 and {1} to {2}), but it listed [{3}] (useAsyncIo={4})",
-                    opened.Count + 1,
-                    opened[0],
-                    opened[^1],
+                    "the program should hold only stdin, stdout and stderr while the host holds fd 3 and {0} more "
+                    + "inheritable descriptors{1}, but it listed [{2}] (useAsyncIo={3})",
+                    opened.Count,
+                    opened.Count == 0 ? string.Empty : $" ({opened[0]} to {opened[^1]})",
                     string.Join(", ", listed),
                     useAsyncIo);
             }

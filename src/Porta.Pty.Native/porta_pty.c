@@ -137,30 +137,33 @@ typedef struct {
 static pthread_mutex_t pty_spawn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * Closes every descriptor above stderr in the forked child, before exec.
+ * Keeps every descriptor above stderr from reaching the program: the forked child closes them before
+ * exec on Linux, and marks them close-on-exec on macOS.
  *
  * forkpty does not mark the controller close-on-exec, and descriptors the host made without
  * O_CLOEXEC (the poller's wakeup pipe, other terminals' controllers) were inherited by every child:
  * terminal B could write into terminal A's controller. Only async-signal-safe calls are used here,
  * since this runs between fork and exec of a multithreaded host.
+ *
+ * macOS marks instead of closing, as Crashpad does: close() of a descriptor with a close guard
+ * (guarded_open_np, change_fdguard_np) raises EXC_GUARD and kills the child, while setting
+ * close-on-exec is allowed, and exec then closes the descriptors itself.
  */
 static void pty_close_inherited_fds(void)
 {
 #if defined(__APPLE__)
     struct proc_fdinfo fds[512];
-    for (int pass = 0; pass < 64; pass++) {
-        int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)sizeof(fds));
-        if (bytes <= 0) {
-            break;
-        }
-        int n = bytes / (int)sizeof(fds[0]), closed = 0;
+    int bytes = proc_pidinfo(getpid(), PROC_PIDLISTFDS, 0, fds, (int)sizeof(fds));
+    if (bytes > 0) {
+        int n = bytes / (int)sizeof(fds[0]);
         for (int i = 0; i < n; i++) {
             if (fds[i].proc_fd > 2) {
-                close(fds[i].proc_fd);
-                closed++;
+                fcntl(fds[i].proc_fd, F_SETFD, FD_CLOEXEC);
             }
         }
-        if (closed == 0) {
+        /* A marked descriptor stays in the listing, so listing again cannot show what is left. A full
+         * buffer may mean more remain, and only then does the walk below run. */
+        if (bytes < (int)sizeof(fds)) {
             return;
         }
     }
@@ -201,11 +204,15 @@ static void pty_close_inherited_fds(void)
         return;
     }
 #endif
-    /* Last resort: walk the whole table. */
+    /* Walk the whole table: the last resort, and on macOS what follows a full listing. */
     struct rlimit rl;
     long max = (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) ? (long)rl.rlim_cur : 65536;
     for (long fd = 3; fd < max; fd++) {
+#if defined(__APPLE__)
+        fcntl((int)fd, F_SETFD, FD_CLOEXEC);
+#else
         close((int)fd);
+#endif
     }
 }
 
