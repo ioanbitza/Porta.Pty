@@ -18,6 +18,9 @@ namespace Porta.Pty.Unix
         private const int ECHILD = 10;
         private const int ESRCH = 3;
 
+        /// <summary>The low seven bits of the wait status of a stopped or continued child, on Linux and macOS.</summary>
+        private const int StoppedOrContinued = 0x7f;
+
         private readonly bool useAsyncIo;
         private readonly int controller;
         private readonly PtyDescriptor descriptor;
@@ -240,11 +243,15 @@ namespace Porta.Pty.Unix
         protected abstract bool Close(int controller);
 
         /// <summary>
-        /// OS-specific waitpid that does not block, for the shared reaper.
+        /// OS-specific waitpid that does not block, with WUNTRACED and WCONTINUED, for the shared reaper
+        /// and the blocking watcher.
         /// </summary>
         /// <param name="pid">The process id to check.</param>
         /// <param name="status">The status of the process, when it has one.</param>
-        /// <returns>The pid once it has exited, 0 while it is still running, -1 on failure.</returns>
+        /// <returns>
+        /// The pid once it has exited, stopped or continued (the status tells which), 0 while there is
+        /// nothing to report, -1 on failure.
+        /// </returns>
         protected abstract int WaitPidNoHang(int pid, ref int status);
 
         /// <summary>
@@ -284,12 +291,21 @@ namespace Porta.Pty.Unix
         [DllImport("libporta_pty", SetLastError = true)]
         private static extern int pty_wait_exit_noreap(int pid);
 
-        /// <summary>Collects the child if it has exited, marking it reaped under the signal lock.</summary>
+        /// <summary>
+        /// Collects the child if it has exited, marking it reaped under the signal lock. A stop or continue
+        /// report is taken as well and returned as 0, since the child is still there: Darwin's waitid
+        /// returns for a stopped child until its stop is taken (see <see cref="ChildWatcherThreadProc"/>).
+        /// </summary>
         private int ReapNoHang(int pid, ref int status)
         {
             lock (this.signalGate)
             {
                 int result = this.WaitPidNoHang(pid, ref status);
+                if (result == pid && (status & StoppedOrContinued) == StoppedOrContinued)
+                {
+                    return 0;
+                }
+
                 if (result == pid || (result == -1 && Marshal.GetLastPInvokeError() == ECHILD))
                 {
                     this.reaped = true;
@@ -338,7 +354,13 @@ namespace Porta.Pty.Unix
 
             // Wait without collecting, then collect under the signal lock, so no signal can be sent
             // between waitpid releasing the pid and the connection learning that it did.
-            if (pty_wait_exit_noreap(this.pid) == 0)
+            //
+            // Darwin's waitid returns for a stopped child too, even with only WEXITED, and again on every
+            // call until a waitpid with WUNTRACED takes the stop. ReapNoHang takes it under the lock and
+            // returns 0, and the loop waits again: one pass per stop, none for the continue (measured on
+            // macOS 27). Falling through to the blocking waitpid below would collect the later exit outside
+            // the lock.
+            while (pty_wait_exit_noreap(this.pid) == 0)
             {
                 int result;
                 do
@@ -353,13 +375,22 @@ namespace Porta.Pty.Unix
                     return;
                 }
 
-                if (result == -1 && Marshal.GetLastPInvokeError() == ECHILD)
+                if (result == -1)
                 {
-                    this.MarkReaped();
-                    return;
+                    if (Marshal.GetLastPInvokeError() == ECHILD)
+                    {
+                        this.MarkReaped();
+                        return;
+                    }
+
+                    break;
                 }
+
+                // Paces the loop in case waitid ever keeps returning with no stop left to take.
+                Thread.Sleep(10);
             }
 
+            // Only after waitid itself failed, or waitpid failed in a way the loop above does not expect.
             if (!this.WaitPid(this.pid, ref status))
             {
                 int errno = Marshal.GetLastWin32Error();

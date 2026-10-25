@@ -7,6 +7,7 @@ namespace Porta.Pty.Tests
     using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using System.IO;
     using System.Linq;
     using System.Reflection;
     using System.Runtime.InteropServices;
@@ -19,7 +20,8 @@ namespace Porta.Pty.Tests
     /// and SIGKILL, and the controller's close-on-exec flag for processes started outside Porta.
     ///
     /// <para>The connections are the library's own Mac and Linux connections; only SendSignal, the one
-    /// place a signal leaves the library, is overridden, to record each signal with the result of kill(2).
+    /// place a signal leaves the library, is overridden, to record each signal with the result of kill(2),
+    /// and the two waits are wrapped, to count them and to act right after a collection.
     /// Children are started by the test with posix_spawn and the controller is /dev/null, since no
     /// terminal is needed to collect or signal a child.</para>
     /// </summary>
@@ -38,6 +40,10 @@ namespace Porta.Pty.Tests
         private static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
         private static bool IsMac => RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+
+        private static int SIGSTOP => IsMac ? 17 : 19;
+
+        private static int SIGCONT => IsMac ? 19 : 18;
 
         /// <summary>
         /// A child collected by a third party (here the test's own waitpid, as a host with SIGCHLD ignored
@@ -164,6 +170,99 @@ namespace Porta.Pty.Tests
                 calls,
                 iterations - lost,
                 lost);
+        }
+
+        /// <summary>
+        /// A child stopped and continued before it exits is collected once, under the signal lock, and the
+        /// library does not poll while it is stopped. Darwin's waitid(WEXITED | WNOWAIT) returns as soon as the
+        /// child stops, and again on every call until a waitpid with WUNTRACED takes the stop (measured on
+        /// macOS 27: more than two million returns in half a second). The blocking watcher fell through to a
+        /// plain blocking waitpid there, outside the lock, and collected the later exit before the collected
+        /// flag was set.
+        ///
+        /// <para>Right after the wait that collects the exit, another thread signals the child through
+        /// SignalChild (signal 0), and the collecting thread gives it 200 ms. Under the lock that signal waits
+        /// for the flag and is never sent; outside it, it reaches the freed pid and kill(2) reports ESRCH. The
+        /// no-hang waits made while the child is stopped are counted. Linux's waitid does not return for a
+        /// stop, so there this checks that a stop and a continue change nothing.</para>
+        /// </summary>
+        [TestMethod]
+        [DataRow(false, DisplayName = "blocking")]
+        [DataRow(true, DisplayName = "non-blocking")]
+        public void Unix_AChildStoppedAndContinued_IsCollectedOnceUnderTheLock_WithoutPollingWhileStopped(bool useAsyncIo)
+        {
+            if (IsWindows)
+            {
+                Assert.Inconclusive("stopping a child with SIGSTOP is a Unix concern");
+            }
+
+            var release = Path.Combine(Path.GetTempPath(), $"porta-pty-release-{Guid.NewGuid():N}");
+            var pid = SpawnChild($"while [ ! -e '{release}' ]; do /bin/sleep 0.02; done; exit 7");
+            using var probe = Probe.Create(OpenDevNull(), pid, useAsyncIo, forward: true);
+            var exits = new ConcurrentQueue<int>();
+            probe.Connection.ProcessExited += (_, e) => exits.Enqueue(e.ExitCode);
+            var signallers = new ConcurrentQueue<Thread>();
+            probe.Waits.AfterCollect = () =>
+            {
+                var signaller = new Thread(() => probe.Signal(0));
+                signaller.Start();
+                signaller.Join(200);
+                signallers.Enqueue(signaller);
+            };
+
+            try
+            {
+                var beforeStop = probe.Waits.NoHangWaits;
+                kill(pid, SIGSTOP).Should().Be(0, $"SIGSTOP to child {pid} failed with errno {Marshal.GetLastPInvokeError()}");
+                WaitUntil(() => IsStopped(pid), $"child {pid} did not stop after SIGSTOP");
+                Thread.Sleep(500);
+                var whileStopped = probe.Waits.NoHangWaits - beforeStop;
+
+                kill(pid, SIGCONT).Should().Be(0, $"SIGCONT to child {pid} failed with errno {Marshal.GetLastPInvokeError()}");
+                WaitUntil(() => !IsStopped(pid), $"child {pid} did not run again after SIGCONT");
+                File.WriteAllText(release, string.Empty);
+
+                if (!probe.Connection.WaitForExit(TestTimeoutMs))
+                {
+                    var status = 0;
+                    if (useAsyncIo && waitpid(pid, ref status, WNOHANG) == pid)
+                    {
+                        Assert.Inconclusive("the library did not report the exit (the lost exit of the non-blocking reaper)");
+                    }
+
+                    Assert.Fail($"the library did not report the exit of child {pid} within {TestTimeoutMs} ms (useAsyncIo={useAsyncIo})");
+                }
+
+                // Room for a second report, which must not come.
+                Thread.Sleep(200);
+                foreach (var signaller in signallers)
+                {
+                    signaller.Join();
+                }
+
+                using var scope = new AwesomeAssertions.Execution.AssertionScope();
+                exits.Should().Equal(new[] { 7 }, "the child should be reported once, with its exit code 7 (useAsyncIo={0})", useAsyncIo);
+                probe.Connection.ExitCode.Should().Be(7, "a stop or continue report is not the exit (useAsyncIo={0})", useAsyncIo);
+                probe.Sent.Should().BeEmpty(
+                    "no signal may leave once the child is collected (useAsyncIo={0}); sent [{1}]",
+                    useAsyncIo,
+                    string.Join(", ", probe.Sent.Select(s => $"{s.Signal} -> {s.Result}/errno {s.Errno}")));
+                whileStopped.Should().BeLessThanOrEqualTo(
+                    2,
+                    "the library should take the stop once and wait, not poll, while the child is stopped (useAsyncIo={0})",
+                    useAsyncIo);
+            }
+            finally
+            {
+                if (!probe.Connection.WaitForExit(0))
+                {
+                    // Failed before the exit was reported: the child is not collected, so the pid is still its own.
+                    kill(pid, SIGKILL);
+                    probe.Connection.WaitForExit(TestTimeoutMs);
+                }
+
+                File.Delete(release);
+            }
         }
 
         /// <summary>
@@ -437,6 +536,37 @@ namespace Porta.Pty.Tests
             Assert.Fail($"child {pid} did not exec {path} within {TestTimeoutMs} ms");
         }
 
+        private static void WaitUntil(Func<bool> condition, string failure)
+        {
+            var clock = Stopwatch.StartNew();
+            while (!condition())
+            {
+                if (clock.ElapsedMilliseconds > TestTimeoutMs)
+                {
+                    Assert.Fail($"{failure} within {TestTimeoutMs} ms");
+                }
+
+                Thread.Sleep(5);
+            }
+        }
+
+        /// <summary>Whether the process is stopped: SSTOP in its BSD info on macOS, state T in /proc on Linux.</summary>
+        private static bool IsStopped(int pid)
+        {
+            if (IsMac)
+            {
+                const int PROC_PIDTBSDINFO = 3;
+                const int SizeOfProcBsdInfo = 136;
+                const uint SSTOP = 4;
+                var info = new byte[SizeOfProcBsdInfo];
+                return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info, info.Length) == info.Length
+                    && BitConverter.ToUInt32(info, 4) == SSTOP;
+            }
+
+            var stat = File.ReadAllText($"/proc/{pid}/stat");
+            return stat[stat.LastIndexOf(')') + 2] is 'T' or 't';
+        }
+
         private static int OpenDevNull()
         {
             var fd = open("/dev/null", O_RDWR);
@@ -457,25 +587,68 @@ namespace Porta.Pty.Tests
         private static extern int proc_pidpath(int pid, byte[] buffer, uint size);
 
         [DllImport("libc", SetLastError = true)]
+        private static extern int proc_pidinfo(int pid, int flavor, ulong arg, byte[] buffer, int size);
+
+        [DllImport("libc", SetLastError = true)]
         private static extern int waitpid(int pid, ref int status, int options);
 
         private readonly record struct Sent(int Signal, int Result, int Errno);
+
+        /// <summary>Counts the library's no-hang waits, and runs a hook right after a wait that collected the child.</summary>
+        private sealed class WaitRecord
+        {
+            private int noHangWaits;
+
+            /// <summary>Called on the collecting thread, before the library has marked the child collected.</summary>
+            public Action? AfterCollect { get; set; }
+
+            public int NoHangWaits => Volatile.Read(ref this.noHangWaits);
+
+            public int NoHang(int pid, int result, int status)
+            {
+                Interlocked.Increment(ref this.noHangWaits);
+                this.Waited(result == pid, status);
+                return result;
+            }
+
+            public bool Blocking(bool collected, int status)
+            {
+                this.Waited(collected, status);
+                return collected;
+            }
+
+            private void Waited(bool reported, int status)
+            {
+                // Low bits 0x7f are a stop or continue report, which collects nothing.
+                if (!reported || (status & 0x7f) == 0x7f || this.AfterCollect is not { } hook)
+                {
+                    return;
+                }
+
+                var errno = Marshal.GetLastPInvokeError();
+                hook();
+                Marshal.SetLastPInvokeError(errno);
+            }
+        }
 
         /// <summary>The library's own platform connection, with every signal it sends recorded.</summary>
         private sealed class Probe : IDisposable
         {
             private readonly Func<int, bool> signal;
 
-            private Probe(Unix.PtyConnection connection, ConcurrentQueue<Sent> sent, Func<int, bool> signal)
+            private Probe(Unix.PtyConnection connection, ConcurrentQueue<Sent> sent, Func<int, bool> signal, WaitRecord waits)
             {
                 this.Connection = connection;
                 this.Sent = sent;
                 this.signal = signal;
+                this.Waits = waits;
             }
 
             public Unix.PtyConnection Connection { get; }
 
             public ConcurrentQueue<Sent> Sent { get; }
+
+            public WaitRecord Waits { get; }
 
             /// <summary>
             /// Records each signal; when <paramref name="forward"/> is false nothing is sent, so a signal the
@@ -487,11 +660,11 @@ namespace Porta.Pty.Tests
                 if (IsMac)
                 {
                     var mac = new RecordingMacConnection(controller, pid, useAsyncIo, forward, sent);
-                    return new Probe(mac, sent, mac.Signal);
+                    return new Probe(mac, sent, mac.Signal, mac.Waits);
                 }
 
                 var linux = new RecordingLinuxConnection(controller, pid, useAsyncIo, forward, sent);
-                return new Probe(linux, sent, linux.Signal);
+                return new Probe(linux, sent, linux.Signal, linux.Waits);
             }
 
             public bool Signal(int signalNumber) => this.signal(signalNumber);
@@ -536,8 +709,22 @@ namespace Porta.Pty.Tests
             /// <summary>Called with each signal once it is recorded, on the thread that sent it.</summary>
             public Action<int>? AfterSignal { get; set; }
 
+            public WaitRecord Waits { get; } = new WaitRecord();
+
             /// <summary>The platform kill step itself, without the public Kill's check before it.</summary>
             public bool PlatformKill() => this.Kill(0);
+
+            protected override int WaitPidNoHang(int pid, ref int status)
+            {
+                var result = base.WaitPidNoHang(pid, ref status);
+                return this.Waits.NoHang(pid, result, status);
+            }
+
+            protected override bool WaitPid(int pid, ref int status)
+            {
+                var collected = base.WaitPid(pid, ref status);
+                return this.Waits.Blocking(collected, status);
+            }
 
             protected override int SendSignal(int pid, int signal)
             {
@@ -567,6 +754,20 @@ namespace Porta.Pty.Tests
             }
 
             public bool Signal(int signal) => this.SignalChild(signal);
+
+            public WaitRecord Waits { get; } = new WaitRecord();
+
+            protected override int WaitPidNoHang(int pid, ref int status)
+            {
+                var result = base.WaitPidNoHang(pid, ref status);
+                return this.Waits.NoHang(pid, result, status);
+            }
+
+            protected override bool WaitPid(int pid, ref int status)
+            {
+                var collected = base.WaitPid(pid, ref status);
+                return this.Waits.Blocking(collected, status);
+            }
 
             protected override int SendSignal(int pid, int signal)
             {

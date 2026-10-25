@@ -17,6 +17,8 @@ namespace Porta.Pty.Linux
 
         // waitpid options
         internal const int WNOHANG = 1;
+        internal const int WUNTRACED = 2;
+        internal const int WCONTINUED = 8;
 
         private const string LibPortaPty = "libporta_pty";
 
