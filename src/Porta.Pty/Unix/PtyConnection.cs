@@ -18,11 +18,22 @@ namespace Porta.Pty.Unix
         private const int ECHILD = 10;
         private const int ESRCH = 3;
 
+        /// <summary>The low seven bits of the wait status of a stopped or continued child, on Linux and macOS.</summary>
+        private const int StoppedOrContinued = 0x7f;
+
         private readonly bool useAsyncIo;
         private readonly int controller;
         private readonly PtyDescriptor descriptor;
         private readonly int pid;
         private readonly ManualResetEvent terminalProcessTerminatedEvent = new ManualResetEvent(false);
+
+        /// <summary>
+        /// Serialises collecting the child with signalling it. While the child is not collected its pid
+        /// cannot be reissued (at worst it is a zombie), so a signal sent under this lock with
+        /// <see cref="reaped"/> still false can only reach the child.
+        /// </summary>
+        private readonly object signalGate = new object();
+        private bool reaped;
         private int exitCode;
         private int exitSignal;
         private bool isDisposed;
@@ -95,7 +106,7 @@ namespace Porta.Pty.Unix
                 // One reaper for the whole process instead of a thread apiece. This is the half that
                 // actually moves the number: making reads threadless still left a watcher per
                 // connection blocked in waitpid.
-                PtyReaper.Instance.Register(pid, this.WaitPidNoHang, this.OnChildExited);
+                PtyReaper.Instance.Register(pid, this.ReapNoHang, this.OnChildExited);
             }
             else
             {
@@ -160,10 +171,11 @@ namespace Porta.Pty.Unix
             // back to back and the third started failing; each test alone had always been fine.
             this.TryClose();
 
-            // Deliberately NOT unregistering from the reaper. TryKill above sends SIGHUP and then
-            // SIGKILL, but a signalled child is not a collected one -- it stays a zombie until
-            // somebody waits on it. Dropping the registration here meant nothing ever did, so a
-            // disposed connection leaked a process table entry for the life of the host.
+            // Deliberately NOT unregistering from the reaper. TryKill above signals a child that is
+            // not collected yet (SIGHUP, and on macOS SIGKILL if it outlives the grace period), but a
+            // signalled child is not a collected one -- it stays a zombie until somebody waits on it.
+            // Dropping the registration here meant nothing ever did, so a disposed connection leaked
+            // a process table entry for the life of the host.
             //
             // The blocking path does not have that problem because its watcher thread stays in
             // waitpid until the child is collected, and keeps doing so after Dispose. Leaving the
@@ -177,6 +189,11 @@ namespace Porta.Pty.Unix
         /// <inheritdoc/>
         public void Kill()
         {
+            if (Volatile.Read(ref this.reaped))
+            {
+                return;
+            }
+
             if (!this.Kill(this.controller))
             {
                 int errno = Marshal.GetLastWin32Error();
@@ -227,11 +244,15 @@ namespace Porta.Pty.Unix
         protected abstract bool Close(int controller);
 
         /// <summary>
-        /// OS-specific waitpid that does not block, for the shared reaper.
+        /// OS-specific waitpid that does not block, with WUNTRACED and WCONTINUED, for the shared reaper
+        /// and the blocking watcher.
         /// </summary>
         /// <param name="pid">The process id to check.</param>
         /// <param name="status">The status of the process, when it has one.</param>
-        /// <returns>The pid once it has exited, 0 while it is still running, -1 on failure.</returns>
+        /// <returns>
+        /// The pid once it has exited, stopped or continued (the status tells which), 0 while there is
+        /// nothing to report, -1 on failure.
+        /// </returns>
         protected abstract int WaitPidNoHang(int pid, ref int status);
 
         /// <summary>
@@ -241,6 +262,59 @@ namespace Porta.Pty.Unix
         /// <param name="status">The status of the process.</param>
         /// <returns>True if the function succeeded to get the status of the process, false otherwise.</returns>
         protected abstract bool WaitPid(int pid, ref int status);
+
+        /// <summary>OS-specific kill(2) by pid; only <see cref="SignalChild"/> calls it.</summary>
+        /// <param name="pid">The process id to signal.</param>
+        /// <param name="signal">The signal number.</param>
+        /// <returns>0 on success, -1 on failure with errno set.</returns>
+        protected abstract int SendSignal(int pid, int signal);
+
+        /// <summary>
+        /// Sends a signal to the child unless it has already been collected, under the same lock that
+        /// collecting it takes, so the pid cannot have been handed to another process meanwhile.
+        /// </summary>
+        /// <param name="signal">The signal number.</param>
+        /// <returns>True when the signal was sent or there was nothing left to signal.</returns>
+        protected bool SignalChild(int signal)
+        {
+            lock (this.signalGate)
+            {
+                if (this.reaped)
+                {
+                    return true;
+                }
+
+                return this.SendSignal(this.pid, signal) != -1;
+            }
+        }
+
+        /// <summary>Blocks until the pid has exited, leaving it uncollected (waitid with WNOWAIT).</summary>
+        [DllImport("libporta_pty", SetLastError = true)]
+        private static extern int pty_wait_exit_noreap(int pid);
+
+        /// <summary>
+        /// Collects the child if it has exited, marking it reaped under the signal lock. A stop or continue
+        /// report is taken as well and returned as 0, since the child is still there: Darwin's waitid
+        /// returns for a stopped child until its stop is taken (see <see cref="ChildWatcherThreadProc"/>).
+        /// </summary>
+        private int ReapNoHang(int pid, ref int status)
+        {
+            lock (this.signalGate)
+            {
+                int result = this.WaitPidNoHang(pid, ref status);
+                if (result == pid && (status & StoppedOrContinued) == StoppedOrContinued)
+                {
+                    return 0;
+                }
+
+                if (result == pid || (result == -1 && Marshal.GetLastPInvokeError() == ECHILD))
+                {
+                    this.reaped = true;
+                }
+
+                return result;
+            }
+        }
 
         /// <summary>
         /// Attempts to kill the process without throwing an exception.
@@ -278,6 +352,46 @@ namespace Porta.Pty.Unix
             Debug.WriteLine($"Waiting on {this.pid}");
 
             int status = 0;
+
+            // Wait without collecting, then collect under the signal lock, so no signal can be sent
+            // between waitpid releasing the pid and the connection learning that it did.
+            //
+            // Darwin's waitid returns for a stopped child too, even with only WEXITED, and again on every
+            // call until a waitpid with WUNTRACED takes the stop. ReapNoHang takes it under the lock and
+            // returns 0, and the loop waits again: one pass per stop, none for the continue (measured on
+            // macOS 27). Falling through to the blocking waitpid below would collect the later exit outside
+            // the lock.
+            while (pty_wait_exit_noreap(this.pid) == 0)
+            {
+                int result;
+                do
+                {
+                    result = this.ReapNoHang(this.pid, ref status);
+                }
+                while (result == -1 && Marshal.GetLastPInvokeError() == EINTR);
+
+                if (result == this.pid)
+                {
+                    this.OnChildExited(status);
+                    return;
+                }
+
+                if (result == -1)
+                {
+                    if (Marshal.GetLastPInvokeError() == ECHILD)
+                    {
+                        this.MarkReaped();
+                        return;
+                    }
+
+                    break;
+                }
+
+                // Paces the loop in case waitid ever keeps returning with no stop left to take.
+                Thread.Sleep(10);
+            }
+
+            // Only after waitid itself failed, or waitpid failed in a way the loop above does not expect.
             if (!this.WaitPid(this.pid, ref status))
             {
                 int errno = Marshal.GetLastWin32Error();
@@ -288,8 +402,8 @@ namespace Porta.Pty.Unix
                 }
                 else if (errno == ECHILD)
                 {
-                    // waitpid is already handled elsewhere.
-                    // Not an error.
+                    // Collected by someone else: the pid is free and may already be another process's.
+                    this.MarkReaped();
                 }
                 else
                 {
@@ -300,7 +414,20 @@ namespace Porta.Pty.Unix
             }
 
             Debug.WriteLine($"Wait succeeded");
+            this.MarkReaped();
             this.OnChildExited(status);
+        }
+
+        /// <summary>
+        /// Records that the child is collected, under the lock <see cref="SignalChild"/> takes, so no signal
+        /// leaves for its pid from here on.
+        /// </summary>
+        private void MarkReaped()
+        {
+            lock (this.signalGate)
+            {
+                this.reaped = true;
+            }
         }
 
         /// <summary>

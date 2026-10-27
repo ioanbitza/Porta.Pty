@@ -21,6 +21,8 @@ namespace Porta.Pty.Mac
 
         // waitpid options
         internal const int WNOHANG = 1;
+        internal const int WUNTRACED = 2;
+        internal const int WCONTINUED = 0x10;
 
         private const string LibPortaPty = "libporta_pty";
 
